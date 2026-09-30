@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/types/typeutil"
 )
 
 var maxLines int
@@ -43,8 +44,8 @@ func run(pass *analysis.Pass) (any, error) {
 				continue
 			}
 			if maxLines > 0 {
-				start := pass.Fset.Position(fn.Pos()).Line
-				end := pass.Fset.Position(fn.End()).Line
+				start := pass.Fset.PositionFor(fn.Pos(), false).Line
+				end := pass.Fset.PositionFor(fn.End(), false).Line
 				if n := end - start + 1; n > maxLines {
 					pass.Reportf(fn.Pos(), "function %s is %d lines (limit %d)", fn.Name.Name, n, maxLines)
 				}
@@ -86,22 +87,14 @@ func checkPure(pass *analysis.Pass, fn *ast.FuncDecl, pure map[types.Object]bool
 			return false
 		case *ast.AssignStmt:
 			for _, lhs := range x.Lhs {
-				if _, ok := lhs.(*ast.Ident); !ok {
-					pass.Reportf(lhs.Pos(), "pure function cannot assign through a reference")
-				}
+				checkAssignment(pass, lhs)
 			}
 		case *ast.IncDecStmt:
-			if _, ok := x.X.(*ast.Ident); !ok {
+			if _, ok := ast.Unparen(x.X).(*ast.Ident); !ok {
 				pass.Reportf(x.Pos(), "pure function cannot mutate through a reference")
 			}
 		case *ast.RangeStmt:
-			t := pass.TypesInfo.TypeOf(x.X)
-			if t != nil {
-				switch t.Underlying().(type) {
-				case *types.Map, *types.Chan, *types.Signature:
-					pass.Reportf(x.Pos(), "pure function cannot range over a map, channel, or iterator")
-				}
-			}
+			checkRange(pass, x)
 		case *ast.UnaryExpr:
 			if x.Op == token.ARROW || x.Op == token.AND {
 				pass.Reportf(x.Pos(), "pure function cannot receive from a channel or take an address")
@@ -110,34 +103,79 @@ func checkPure(pass *analysis.Pass, fn *ast.FuncDecl, pure map[types.Object]bool
 			if !pass.TypesInfo.Types[x].IsType() {
 				pass.Reportf(x.Pos(), "pure function cannot dereference a pointer")
 			}
+		case *ast.IndexExpr:
+			if !pass.TypesInfo.Types[x].IsType() && arrayPointer(pass.TypesInfo.TypeOf(x.X)) {
+				pass.Reportf(x.Pos(), "pure function cannot dereference a pointer")
+			}
+		case *ast.SliceExpr:
+			if arrayPointer(pass.TypesInfo.TypeOf(x.X)) {
+				pass.Reportf(x.Pos(), "pure function cannot dereference a pointer")
+			}
+		case *ast.SelectorExpr:
+			if selection := pass.TypesInfo.Selections[x]; selection != nil && selection.Indirect() {
+				pass.Reportf(x.Pos(), "pure function cannot dereference a pointer")
+			}
 		case *ast.Ident:
 			if v, ok := pass.TypesInfo.Uses[x].(*types.Var); ok && v.Pkg() != nil && v.Parent() == v.Pkg().Scope() {
 				pass.Reportf(x.Pos(), "pure function cannot access package variable %s", x.Name)
 			}
 		case *ast.CallExpr:
-			if pass.TypesInfo.Types[x.Fun].IsType() { // Type conversion.
-				break
-			}
-			var obj types.Object
-			switch f := x.Fun.(type) {
-			case *ast.Ident:
-				obj = pass.TypesInfo.Uses[f]
-			case *ast.SelectorExpr:
-				obj = pass.TypesInfo.Uses[f.Sel]
-			}
-			if b, ok := obj.(*types.Builtin); ok {
-				switch b.Name() {
-				case "len", "cap", "complex", "real", "imag", "min", "max":
-					break
-				default:
-					pass.Reportf(x.Pos(), "pure function cannot call builtin %s", b.Name())
-				}
-			} else if !pure[obj] {
-				pass.Reportf(x.Pos(), "pure function can only call another marked pure function")
-			}
+			checkCall(pass, x, pure)
 		}
 		return true
 	})
+}
+
+func checkAssignment(pass *analysis.Pass, lhs ast.Expr) {
+	if lhs != nil {
+		if _, ok := ast.Unparen(lhs).(*ast.Ident); !ok {
+			pass.Reportf(lhs.Pos(), "pure function cannot assign through a reference")
+		}
+	}
+}
+
+func checkRange(pass *analysis.Pass, x *ast.RangeStmt) {
+	if x.Tok == token.ASSIGN {
+		checkAssignment(pass, x.Key)
+		checkAssignment(pass, x.Value)
+	}
+	t := pass.TypesInfo.TypeOf(x.X)
+	for _, term := range typeTerms(t) {
+		switch term.Type().Underlying().(type) {
+		case *types.Map, *types.Chan, *types.Signature:
+			pass.Reportf(x.Pos(), "pure function cannot range over a map, channel, or iterator")
+			return
+		}
+	}
+	// Index-only iteration over an array pointer uses its constant length;
+	// requesting an element also dereferences the pointer.
+	if x.Value != nil && !isBlank(x.Value) && arrayPointer(t) {
+		pass.Reportf(x.Pos(), "pure function cannot dereference a pointer")
+	}
+}
+
+func isBlank(expr ast.Expr) bool {
+	id, ok := ast.Unparen(expr).(*ast.Ident)
+	return ok && id.Name == "_"
+}
+
+func checkCall(pass *analysis.Pass, x *ast.CallExpr, pure map[types.Object]bool) {
+	if pass.TypesInfo.Types[x.Fun].IsType() { // Type conversion.
+		return
+	}
+	obj := typeutil.Callee(pass.TypesInfo, x)
+	if fn, ok := obj.(*types.Func); ok {
+		obj = fn.Origin()
+	}
+	if b, ok := obj.(*types.Builtin); ok {
+		switch b.Name() {
+		case "len", "cap", "complex", "real", "imag", "min", "max":
+		default:
+			pass.Reportf(x.Pos(), "pure function cannot call builtin %s", b.Name())
+		}
+	} else if !pure[obj] {
+		pass.Reportf(x.Pos(), "pure function can only call another marked pure function")
+	}
 }
 
 func valueTuple(tuple *types.Tuple) bool {
