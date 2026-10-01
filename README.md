@@ -14,7 +14,7 @@ Go の標準的な静的解析だけでは、関数が長くなりすぎたこ�
 
 ## 使い方
 
-Go 1.24 以降が必要です。
+Go 1.26 以降が必要です。
 
 ```sh
 go install github.com/ieee0824/mikoto/cmd/mikoto@latest
